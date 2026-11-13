@@ -1,1 +1,212 @@
+# Save this file as .github/workflows/build-freedom-installer.yml
+# Manual build only. No secrets, device access, flashing, or release publishing.
+name: Build Freedom Installer
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: freedom-installer-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: ArmadaOS-Freedom/armadaos-freedom-installer
+  # Pinned official source snapshot, not a release tag or a device-tested build.
+  SOURCE_COMMIT: d61f4090cf232885e5bf77bee553414db978eaf6
+
+jobs:
+  build:
+    name: Build Windows x64 installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out the pinned official source
+        # actions/checkout v4, pinned to a complete commit SHA.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the source revision
+        run: |
+          set -euo pipefail
+          mkdir -p logs dist
+          actual="$(git -C source rev-parse HEAD)"
+          printf 'Official source: %s\nCommit: %s\n' "$SOURCE_REPOSITORY" "$actual" | tee logs/source.txt
+          test "$actual" = "$SOURCE_COMMIT"
+          docker version
+          df -h .
+
+      - name: Build the official builder image
+        working-directory: source
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            -f tools/installer-builder.Dockerfile \
+            -t armada-installer-builder tools \
+            2>&1 | tee ../logs/01-builder-image.log
+
+      - name: Run the documented build-specific tests
+        working-directory: source
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${PWD}:/src" \
+            armada-installer-builder sh -ec '
+              python3 -B -m unittest discover -s maintenance/tests -p test_fetch_build_inputs.py
+              python3 -B -m unittest discover -s maintenance/tests -p test_package_edl.py
+              python3 -B -m unittest discover -s maintenance/tests -p test_build_installer.py
+              python3 -B -m unittest discover -s maintenance/tests -p test_android_driver_packaging.py
+            ' 2>&1 | tee ../logs/02-build-tests.log
+
+      - name: Build and bundle the Windows installer
+        working-directory: source
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          docker run --rm \
+            -v "${PWD}:/src" \
+            -v "${PWD}/artifacts:/work" \
+            armada-installer-builder \
+            python3 -B maintenance/build_installer.py \
+              --work-dir /work/build \
+              --output-dir /work/publish \
+            2>&1 | tee ../logs/03-installer-build.log
+
+      - name: Validate the output and create checksums
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import shutil
+          import struct
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          source = Path("source")
+          dist = Path("dist")
+          dist.mkdir(exist_ok=True)
+          exe = source / "artifacts/publish/FreedomInstaller.App.exe"
+          if not exe.is_file():
+              raise SystemExit("The official build did not produce FreedomInstaller.App.exe")
+
+          # Format check only: never execute the installer on the runner.
+          with exe.open("rb") as stream:
+              header = stream.read(64)
+              if len(header) < 64 or header[:2] != b"MZ":
+                  raise SystemExit("Output is not a Windows executable")
+              pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
+              stream.seek(pe_offset)
+              pe = stream.read(6)
+              if len(pe) != 6 or pe[:4] != b"PE\0\0" or struct.unpack_from("<H", pe, 4)[0] != 0x8664:
+                  raise SystemExit("Output is not a Windows x64 PE executable")
+
+          shutil.copy2(exe, dist / exe.name)
+          shutil.copy2(source / "LICENSE", dist / "INSTALLER-LICENSE.txt")
+          shutil.copy2(source / "maintenance/build-inputs.json", dist / "build-inputs.json")
+          shutil.copy2(source / "artifacts/build/build-record.json", dist / "build-record.json")
+
+          project = ET.parse(source / "src/FreedomInstaller.App/FreedomInstaller.App.csproj")
+          version = project.findtext(".//Version")
+          if not version:
+              raise SystemExit("Could not read the installer version from the official project")
+          commit = os.environ["SOURCE_COMMIT"]
+          repo = os.environ["SOURCE_REPOSITORY"]
+          source_url = f"https://github.com/{repo}/commit/{commit}"
+          run_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          info = {
+              "kind": "Self-built installer; NOT an official published release",
+              "sourceRepository": repo,
+              "sourceCommit": commit,
+              "sourceUrl": source_url,
+              "installerVersion": version,
+              "target": "win-x64",
+              "builtAtUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "workflowRun": run_url,
+              "workflowRevision": os.environ["GITHUB_SHA"],
+              "installerExecuted": False,
+              "deviceTested": False,
+              "systemDeploymentPackageIncluded": False,
+          }
+          (dist / "BUILD-INFO.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+          (dist / "READ-ME-FIRST.txt").write_text(
+              "ArmadaOS Freedom Windows x64 installer - self-built from official source.\n"
+              "This is NOT an official published release or a device-tested build.\n"
+              "No tablet was accessed and no flashing was performed by this workflow.\n"
+              "The Linux/9008 system deployment package is NOT included.\n"
+              "Back up personal files separately before any repartitioning or installation.\n"
+              "Do not bypass a failed hash, driver, firmware, or device compatibility check.\n"
+              f"Installer version: {version}\nSource: {source_url}\nBuild: {run_url}\n",
+              encoding="utf-8",
+          )
+
+          checksums = []
+          exe_hash = ""
+          for file in sorted(dist.iterdir()):
+              if file.is_file() and file.name != "SHA256SUMS.txt":
+                  digest = hashlib.sha256()
+                  with file.open("rb") as stream:
+                      for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                          digest.update(chunk)
+                  checksums.append(f"{digest.hexdigest()}  {file.name}")
+                  if file.name == exe.name:
+                      exe_hash = digest.hexdigest()
+          (dist / "SHA256SUMS.txt").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+          print(f"Installer {version}: {exe.stat().st_size:,} bytes")
+          print(f"SHA-256: {exe_hash}")
+          PY
+
+      - name: Upload the installer download
+        # actions/upload-artifact v4, pinned to a complete commit SHA.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: FreedomInstaller-Windows-x64
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Write the successful download summary
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          info = json.loads(Path("dist/BUILD-INFO.json").read_text(encoding="utf-8"))
+          checksums = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
+          exe_hash = next(line.split()[0] for line in checksums if line.endswith("  FreedomInstaller.App.exe"))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(
+                  "## Windows installer built and uploaded\n\n"
+                  f"- Version: **{info['installerVersion']}**, target: **Windows x64**\n"
+                  f"- [Official source commit]({info['sourceUrl']})\n"
+                  "- Download **FreedomInstaller-Windows-x64** in this run's **Artifacts** section (retained for 14 days).\n"
+                  f"- EXE SHA-256: `{exe_hash}`\n\n"
+                  "> Self-built, not an official published release. No device testing or flashing was performed. "
+                  "The Linux/9008 system deployment package is not included.\n"
+              )
+          PY
+
+      - name: Upload build logs even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: FreedomInstaller-build-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 7
